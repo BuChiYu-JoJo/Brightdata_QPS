@@ -258,6 +258,7 @@ class BrightDataTester:
         self.response_format = response_format
         self.save_details = save_details
         self.brd_json = brd_json
+        self.session = requests.Session()  # Reuse connection pool
 
     def _build_payload(self, engine: str, query: Any) -> Dict[str, Any]:
         if engine not in self.SUPPORTED_ENGINES:
@@ -284,6 +285,7 @@ class BrightDataTester:
             "success": False,
             "error": "",
             "response_excerpt": "",
+            "product": "Brightdata",
         }
 
         payload = self._build_payload(engine, query)
@@ -294,7 +296,7 @@ class BrightDataTester:
 
         start_time = time.perf_counter()
         try:
-            response = requests.post(self.API_URL, json=payload, headers=headers, timeout=30)
+            response = self.session.post(self.API_URL, json=payload, headers=headers, timeout=30)
             duration = round(time.perf_counter() - start_time, 3)
 
             result["status_code"] = response.status_code
@@ -308,7 +310,8 @@ class BrightDataTester:
             result["error"] = error_message
             return result
         except Exception as exc:
-            result["response_time"] = round(time.perf_counter() - start_time, 3)
+            duration = round(time.perf_counter() - start_time, 3)
+            result["response_time"] = duration
             result["success"] = False
             result["error"] = f"Request error: {exc}"
             return result
@@ -378,44 +381,101 @@ class BrightDataTester:
 
         return response.text[:1000]
 
-    def _get_query(self, engine: str, explicit_query: Optional[str]) -> Any:
+    def _get_next_query_fn(self, engine: str, explicit_query: Optional[str]):
+        """
+        Create a query generator function based on engine and explicit_query.
+        
+        For engines with special format requirements (lens, trends, hotels, flights, maps with dict):
+        - Use random.choice from engine-specific pool
+        
+        For regular engines (search, reviews, bing, yandex, duckduckgo):
+        - If explicit_query provided: always return that
+        - Otherwise: use round-robin from keyword pool
+        """
         if explicit_query:
-            return explicit_query
-
+            # User specified query, always use it
+            return lambda: explicit_query
+        
+        # Engines that need dict/special format
         engine_queries = self.ENGINE_SAMPLE_QUERIES.get(engine)
         if engine_queries:
-            return random.choice(engine_queries)
+            # Random choice for stability with structured queries
+            return lambda: random.choice(engine_queries)
+        
+        # Regular engines: round-robin through keyword pool
+        index = {"current": 0}
+        pool = self.KEYWORD_POOL
+        
+        def round_robin_query():
+            query = pool[index["current"] % len(pool)]
+            index["current"] += 1
+            return query
+        
+        return round_robin_query
 
-        return random.choice(self.KEYWORD_POOL)
+    def _run_worker_until(self, engine: str, next_query_fn, end_time: float) -> List[Dict[str, Any]]:
+        """
+        Worker function that runs requests until end_time is reached.
+        Returns list of result dictionaries.
+        """
+        results = []
+        while time.perf_counter() < end_time:
+            query = next_query_fn()
+            result = self.make_request(engine, query)
+            results.append(result)
+        return results
 
-    def run_engine_test(self, engine: str, num_requests: int, concurrency: int, explicit_query: Optional[str]) -> Tuple[
-        List[Dict[str, Any]], Dict[str, Any]]:
-        queries = [self._get_query(engine, explicit_query) for _ in range(num_requests)]
-
+    def run_concurrent_test(
+        self, engine: str, duration_seconds: int, concurrency: int, explicit_query: Optional[str] = None
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """
+        Run duration-based concurrent test for a single engine.
+        
+        Args:
+            engine: Engine name to test
+            duration_seconds: How long to run the test (in seconds)
+            concurrency: Number of concurrent workers
+            explicit_query: Optional explicit query to use for all requests
+            
+        Returns:
+            Tuple of (results list, statistics dict)
+        """
+        end_time = time.perf_counter() + duration_seconds
+        next_query_fn = self._get_next_query_fn(engine, explicit_query)
+        
         results: List[Dict[str, Any]] = []
         start = time.perf_counter()
-
+        
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-            future_to_query = {executor.submit(self.make_request, engine, q): q for q in queries}
-            for future in concurrent.futures.as_completed(future_to_query):
-                results.append(future.result())
-
-        duration = round(time.perf_counter() - start, 3)
-        stats = self._calculate_statistics(engine, num_requests, concurrency, duration, results)
-
+            # Submit workers
+            futures = [
+                executor.submit(self._run_worker_until, engine, next_query_fn, end_time)
+                for _ in range(concurrency)
+            ]
+            
+            # Collect results from all workers
+            for future in concurrent.futures.as_completed(futures):
+                worker_results = future.result()
+                results.extend(worker_results)
+        
+        actual_duration = round(time.perf_counter() - start, 3)
+        total_requests = len(results)
+        
+        stats = self._calculate_statistics(engine, total_requests, concurrency, actual_duration, results)
+        
         if self.save_details:
             self._save_detailed_csv(engine, results)
-
+        
         return results, stats
 
-    def run_all_engines_test(self, engines: Iterable[str], num_requests: int, concurrency: int,
+    def run_all_engines_test(self, engines: Iterable[str], duration_seconds: int, concurrency: int,
                              explicit_query: Optional[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         all_results: List[Dict[str, Any]] = []
         all_stats: List[Dict[str, Any]] = []
 
         for engine in engines:
             print(f"\n=== 开始测试引擎: {engine} ===")
-            results, stats = self.run_engine_test(engine, num_requests, concurrency, explicit_query)
+            results, stats = self.run_concurrent_test(engine, duration_seconds, concurrency, explicit_query)
             all_results.extend(results)
             all_stats.append(stats)
             print(f"=== 引擎 {engine} 测试完成 ===")
@@ -429,6 +489,7 @@ class BrightDataTester:
 
         success_count = len(successes)
         success_rate = round((success_count / total_requests) * 100, 2) if total_requests else 0
+        error_rate = round(((total_requests - success_count) / total_requests) * 100, 2) if total_requests else 0
         avg_response_time = round(sum(response_times_success) / len(response_times_success),
                                   3) if response_times_success else 0
 
@@ -440,16 +501,20 @@ class BrightDataTester:
             return round(values_sorted[rank], 3)
 
         stats = {
+            "产品类别": "Brightdata",
             "引擎": engine,
             "请求总数": total_requests,
             "并发数": concurrency,
             "成功次数": success_count,
             "成功率(%)": success_rate,
+            "错误率(%)": error_rate,
             "请求速率(req/s)": round(total_requests / duration, 3) if duration > 0 else 0,
             "成功平均响应时间(s)": avg_response_time,
             "P50延迟(s)": percentile(response_times_success, 0.5),
             "P75延迟(s)": percentile(response_times_success, 0.75),
             "P90延迟(s)": percentile(response_times_success, 0.9),
+            "P95延迟(s)": percentile(response_times_success, 0.95),
+            "P99延迟(s)": percentile(response_times_success, 0.99),
             "并发完成时间(s)": duration,
             "成功平均响应大小(KB)": round(
                 sum(r.get("response_size", 0) for r in successes) / len(successes), 3
@@ -471,6 +536,7 @@ class BrightDataTester:
             "success",
             "error",
             "response_excerpt",
+            "product",
         ]
 
         with open(filename, "w", newline="", encoding="utf-8") as csvfile:
@@ -486,16 +552,20 @@ class BrightDataTester:
             return
 
         fieldnames = [
+            "产品类别",
             "引擎",
             "请求总数",
             "并发数",
             "请求速率(req/s)",
             "成功次数",
             "成功率(%)",
+            "错误率(%)",
             "成功平均响应时间(s)",
             "P50延迟(s)",
             "P75延迟(s)",
             "P90延迟(s)",
+            "P95延迟(s)",
+            "P99延迟(s)",
             "并发完成时间(s)",
             "成功平均响应大小(KB)",
         ]
@@ -510,26 +580,28 @@ class BrightDataTester:
 
     def _print_statistics_table(self, statistics: List[Dict[str, Any]]) -> None:
         print("\n汇总统计表:")
-        print("-" * 150)
+        print("-" * 180)
         header = (
-            f"{'引擎':<12} {'请求数':>8} {'并发':>6} {'速率(req/s)':>12} "
-            f"{'成功':>8} {'成功率':>8} {'平均响应(s)':>12} {'P50':>8} {'P75':>8} {'P90':>8} "
+            f"{'产品':<10} {'引擎':<12} {'请求数':>8} {'并发':>6} {'速率(req/s)':>12} "
+            f"{'成功':>8} {'成功率':>8} {'错误率':>8} {'平均响应(s)':>12} "
+            f"{'P50':>8} {'P75':>8} {'P90':>8} {'P95':>8} {'P99':>8} "
             f"{'完成时间(s)':>12} {'响应大小(KB)':>14}"
         )
         print(header)
-        print("-" * 150)
+        print("-" * 180)
 
         for stat in statistics:
             row = (
-                f"{stat['引擎']:<12} {stat['请求总数']:>8} {stat['并发数']:>6} "
+                f"{stat['产品类别']:<10} {stat['引擎']:<12} {stat['请求总数']:>8} {stat['并发数']:>6} "
                 f"{stat['请求速率(req/s)']:>12} {stat['成功次数']:>8} "
-                f"{stat['成功率(%)']:>8}% {stat['成功平均响应时间(s)']:>12} "
+                f"{stat['成功率(%)']:>8}% {stat['错误率(%)']:>8}% {stat['成功平均响应时间(s)']:>12} "
                 f"{stat['P50延迟(s)']:>8} {stat['P75延迟(s)']:>8} {stat['P90延迟(s)']:>8} "
+                f"{stat['P95延迟(s)']:>8} {stat['P99延迟(s)']:>8} "
                 f"{stat['并发完成时间(s)']:>12} {stat['成功平均响应大小(KB)']:>14}"
             )
             print(row)
 
-        print("-" * 150)
+        print("-" * 180)
 
 
 def parse_args() -> argparse.Namespace:
@@ -538,22 +610,22 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例用法:
-  # 测试单个引擎 (默认随机关键词)
-  python brightdata_tester.py -t YOUR_TOKEN -z serp_api1 -e search -n 10 -c 5
+  # 测试单个引擎 60 秒 (默认随机关键词)
+  python brigtdata_serp.py -t YOUR_TOKEN -z serp_api1 -e search -d 60 -c 5
 
   # 指定查询关键词并测试多个引擎
-  python brightdata_tester.py -t YOUR_TOKEN -z serp_api1 -e search maps trends -n 5 -c 3 -q pizza
+  python brigtdata_serp.py -t YOUR_TOKEN -z serp_api1 -e search maps trends -d 30 -c 3 -q pizza
 
   # 使用 JSON 响应格式并保存详细记录
-  python brightdata_tester.py -t YOUR_TOKEN -z serp_api1 -e search --format json --save-details
+  python brigtdata_serp.py -t YOUR_TOKEN -z serp_api1 -e search --format json --save-details
         """,
     )
 
-    parser.add_argument("-t", "--api-token", required=True, help="Bright Data API Token")
+    parser.add_argument("-t", "--api-token", help="Bright Data API Token")
     parser.add_argument("-z", "--zone", default="serp_api1", help="Bright Data zone 名称")
     parser.add_argument("-e", "--engines", nargs="+", help="要测试的引擎列表")
     parser.add_argument("--all-engines", action="store_true", help="测试所有支持的引擎")
-    parser.add_argument("-n", "--num-requests", type=int, default=5, help="每个引擎请求数")
+    parser.add_argument("-d", "--duration", type=int, default=60, help="每个引擎测试时长（秒）")
     parser.add_argument("-c", "--concurrency", type=int, default=3, help="并发数")
     parser.add_argument("-q", "--query", help="指定查询关键词 (默认随机)")
     parser.add_argument("--format", choices=["raw", "json"], default="raw", help="Bright Data 响应格式")
@@ -580,6 +652,10 @@ def main() -> None:
             print(f"  {i:2d}. {engine}")
         return
 
+    if not args.api_token:
+        print("错误: 需要提供 API Token (-t/--api-token)")
+        return
+
     if not args.all_engines and not args.engines:
         print("错误: 请使用 -e 指定引擎或使用 --all-engines 测试所有引擎")
         return
@@ -594,7 +670,7 @@ def main() -> None:
         brd_json=args.brd_json if args.brd_json != 0 else None,
     )
 
-    _, statistics = tester.run_all_engines_test(engines, args.num_requests, args.concurrency, args.query)
+    _, statistics = tester.run_all_engines_test(engines, args.duration, args.concurrency, args.query)
     tester.save_summary_statistics(statistics, args.output)
 
 
