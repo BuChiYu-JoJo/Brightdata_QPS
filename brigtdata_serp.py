@@ -12,9 +12,11 @@ responses are supported.
 import argparse
 import concurrent.futures
 import csv
+import itertools
 import json
 import math
 import random
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -402,14 +404,14 @@ class BrightDataTester:
             # Random choice for stability with structured queries
             return lambda: random.choice(engine_queries)
         
-        # Regular engines: round-robin through keyword pool
-        index = {"current": 0}
+        # Regular engines: use itertools.cycle for thread-safe round-robin
         pool = self.KEYWORD_POOL
+        cycle_iter = itertools.cycle(pool)
+        lock = threading.Lock()
         
         def round_robin_query():
-            query = pool[index["current"] % len(pool)]
-            index["current"] += 1
-            return query
+            with lock:
+                return next(cycle_iter)
         
         return round_robin_query
 
