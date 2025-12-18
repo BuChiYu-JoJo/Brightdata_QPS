@@ -472,15 +472,47 @@ class BrightDataTester:
 
     def run_all_engines_test(self, engines: Iterable[str], duration_seconds: int, concurrency: int,
                              explicit_query: Optional[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Run concurrent tests for multiple engines simultaneously.
+        Each engine runs in its own thread pool with the specified concurrency.
+        All engines start at the same time and run for the same duration.
+        """
         all_results: List[Dict[str, Any]] = []
         all_stats: List[Dict[str, Any]] = []
-
-        for engine in engines:
+        
+        engines_list = list(engines)
+        
+        if len(engines_list) == 1:
+            # Single engine - run directly
+            engine = engines_list[0]
             print(f"\n=== 开始测试引擎: {engine} ===")
             results, stats = self.run_concurrent_test(engine, duration_seconds, concurrency, explicit_query)
             all_results.extend(results)
             all_stats.append(stats)
             print(f"=== 引擎 {engine} 测试完成 ===")
+        else:
+            # Multiple engines - run concurrently
+            print(f"\n=== 开始并发测试 {len(engines_list)} 个引擎 ===")
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(engines_list)) as executor:
+                # Submit all engine tests concurrently
+                future_to_engine = {
+                    executor.submit(self.run_concurrent_test, engine, duration_seconds, concurrency, explicit_query): engine
+                    for engine in engines_list
+                }
+                
+                # Collect results as they complete
+                for future in concurrent.futures.as_completed(future_to_engine):
+                    engine = future_to_engine[future]
+                    try:
+                        results, stats = future.result()
+                        all_results.extend(results)
+                        all_stats.append(stats)
+                        print(f"=== 引擎 {engine} 测试完成 ===")
+                    except Exception as exc:
+                        print(f"=== 引擎 {engine} 测试失败: {exc} ===")
+            
+            print(f"=== 所有引擎测试完成 ===")
 
         return all_results, all_stats
 
