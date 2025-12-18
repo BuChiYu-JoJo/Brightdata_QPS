@@ -415,21 +415,65 @@ class BrightDataTester:
         
         return round_robin_query
 
-    def _run_worker_until(self, engine: str, next_query_fn, end_time: float, concurrency: int) -> List[Dict[str, Any]]:
+    def _run_worker_until(self, engine: str, next_query_fn, end_time: float, concurrency: int, 
+                         target_qps: Optional[float] = None, max_requests: Optional[int] = None,
+                         request_counter: Optional[list] = None) -> List[Dict[str, Any]]:
         """
-        Worker function that runs requests until end_time is reached.
+        Worker function that runs requests until end_time is reached or max_requests is hit.
+        
+        Args:
+            engine: Engine name
+            next_query_fn: Function to get next query
+            end_time: Time to stop running
+            concurrency: Number of concurrent workers
+            target_qps: If set, pace requests to achieve this QPS (per worker)
+            max_requests: If set, stop after total requests across all workers reaches this
+            request_counter: Shared list for tracking total requests (for max_requests)
+            
         Returns list of result dictionaries.
         """
         results = []
+        worker_qps = target_qps / concurrency if target_qps else None
+        min_interval = 1.0 / worker_qps if worker_qps else 0
+        
+        last_request_time = time.perf_counter()
+        
         while time.perf_counter() < end_time:
+            # Check max_requests limit
+            if max_requests and request_counter is not None:
+                if len(request_counter) >= max_requests:
+                    break
+            
+            # Rate limiting: wait if we're going too fast
+            if worker_qps:
+                elapsed = time.perf_counter() - last_request_time
+                if elapsed < min_interval:
+                    time.sleep(min_interval - elapsed)
+            
+            last_request_time = time.perf_counter()
+            
+            # Check again after sleep
+            if time.perf_counter() >= end_time:
+                break
+                
+            if max_requests and request_counter is not None:
+                if len(request_counter) >= max_requests:
+                    break
+            
             query = next_query_fn()
             result = self.make_request(engine, query)
             result["concurrency"] = concurrency
             results.append(result)
+            
+            # Update shared counter
+            if request_counter is not None:
+                request_counter.append(1)
+        
         return results
 
     def run_concurrent_test(
-        self, engine: str, duration_seconds: int, concurrency: int, explicit_query: Optional[str] = None
+        self, engine: str, duration_seconds: int, concurrency: int, explicit_query: Optional[str] = None,
+        target_qps: Optional[float] = None, max_requests: Optional[int] = None
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """
         Run duration-based concurrent test for a single engine.
@@ -439,6 +483,8 @@ class BrightDataTester:
             duration_seconds: How long to run the test (in seconds)
             concurrency: Number of concurrent workers
             explicit_query: Optional explicit query to use for all requests
+            target_qps: If set, limit request rate to this QPS (more economical)
+            max_requests: If set, stop after this many total requests
             
         Returns:
             Tuple of (results list, statistics dict)
@@ -446,13 +492,17 @@ class BrightDataTester:
         end_time = time.perf_counter() + duration_seconds
         next_query_fn = self._get_next_query_fn(engine, explicit_query)
         
+        # Shared counter for max_requests limit (thread-safe via GIL for list append)
+        request_counter = [] if max_requests else None
+        
         results: List[Dict[str, Any]] = []
         start = time.perf_counter()
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
             # Submit workers
             futures = [
-                executor.submit(self._run_worker_until, engine, next_query_fn, end_time, concurrency)
+                executor.submit(self._run_worker_until, engine, next_query_fn, end_time, concurrency,
+                              target_qps, max_requests, request_counter)
                 for _ in range(concurrency)
             ]
             
@@ -464,7 +514,7 @@ class BrightDataTester:
         actual_duration = round(time.perf_counter() - start, 3)
         total_requests = len(results)
         
-        stats = self._calculate_statistics(engine, total_requests, concurrency, actual_duration, results)
+        stats = self._calculate_statistics(engine, total_requests, concurrency, actual_duration, results, target_qps)
         
         if self.save_details:
             self._save_detailed_csv(engine, concurrency, results)
@@ -472,13 +522,15 @@ class BrightDataTester:
         return results, stats
 
     def run_all_engines_test(self, engines: Iterable[str], duration_seconds: int, concurrency: int,
-                             explicit_query: Optional[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+                             explicit_query: Optional[str], target_qps: Optional[float] = None,
+                             max_requests: Optional[int] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         all_results: List[Dict[str, Any]] = []
         all_stats: List[Dict[str, Any]] = []
 
         for engine in engines:
             print(f"\n=== 开始测试引擎: {engine} ===")
-            results, stats = self.run_concurrent_test(engine, duration_seconds, concurrency, explicit_query)
+            results, stats = self.run_concurrent_test(engine, duration_seconds, concurrency, explicit_query,
+                                                     target_qps, max_requests)
             all_results.extend(results)
             all_stats.append(stats)
             print(f"=== 引擎 {engine} 测试完成 ===")
@@ -486,7 +538,7 @@ class BrightDataTester:
         return all_results, all_stats
 
     def _calculate_statistics(self, engine: str, total_requests: int, concurrency: int, duration: float,
-                              results: List[Dict[str, Any]]) -> Dict[str, Any]:
+                              results: List[Dict[str, Any]], target_qps: Optional[float] = None) -> Dict[str, Any]:
         successes = [r for r in results if r.get("success")]
         response_times_success = [r.get("response_time") for r in successes if r.get("response_time") is not None]
 
@@ -503,6 +555,8 @@ class BrightDataTester:
             rank = max(1, math.ceil(pct * len(values_sorted))) - 1
             return round(values_sorted[rank], 3)
 
+        actual_qps = round(total_requests / duration, 3) if duration > 0 else 0
+
         stats = {
             "产品类别": "Brightdata",
             "引擎": engine,
@@ -511,7 +565,8 @@ class BrightDataTester:
             "成功次数": success_count,
             "成功率(%)": success_rate,
             "错误率(%)": error_rate,
-            "请求速率(req/s)": round(total_requests / duration, 3) if duration > 0 else 0,
+            "请求速率(req/s)": actual_qps,
+            "目标QPS": target_qps if target_qps else "无限制",
             "成功平均响应时间(s)": avg_response_time,
             "P50延迟(s)": percentile(response_times_success, 0.5),
             "P75延迟(s)": percentile(response_times_success, 0.75),
@@ -561,6 +616,7 @@ class BrightDataTester:
             "请求总数",
             "并发数",
             "请求速率(req/s)",
+            "目标QPS",
             "成功次数",
             "成功率(%)",
             "错误率(%)",
@@ -584,20 +640,22 @@ class BrightDataTester:
 
     def _print_statistics_table(self, statistics: List[Dict[str, Any]]) -> None:
         print("\n汇总统计表:")
-        print("-" * 180)
+        print("-" * 200)
         header = (
-            f"{'产品':<10} {'引擎':<12} {'请求数':>8} {'并发':>6} {'速率(req/s)':>12} "
+            f"{'产品':<10} {'引擎':<12} {'请求数':>8} {'并发':>6} {'速率(req/s)':>12} {'目标QPS':>12} "
             f"{'成功':>8} {'成功率':>8} {'错误率':>8} {'平均响应(s)':>12} "
             f"{'P50':>8} {'P75':>8} {'P90':>8} {'P95':>8} {'P99':>8} "
             f"{'完成时间(s)':>12} {'响应大小(KB)':>14}"
         )
         print(header)
-        print("-" * 180)
+        print("-" * 200)
 
         for stat in statistics:
+            target_qps_str = str(stat['目标QPS']) if isinstance(stat['目标QPS'], (int, float)) else stat['目标QPS']
             row = (
                 f"{stat['产品类别']:<10} {stat['引擎']:<12} {stat['请求总数']:>8} {stat['并发数']:>6} "
-                f"{stat['请求速率(req/s)']:>12} {stat['成功次数']:>8} "
+                f"{stat['请求速率(req/s)']:>12} {target_qps_str:>12} "
+                f"{stat['成功次数']:>8} "
                 f"{stat['成功率(%)']:>8}% {stat['错误率(%)']:>8}% {stat['成功平均响应时间(s)']:>12} "
                 f"{stat['P50延迟(s)']:>8} {stat['P75延迟(s)']:>8} {stat['P90延迟(s)']:>8} "
                 f"{stat['P95延迟(s)']:>8} {stat['P99延迟(s)']:>8} "
@@ -605,7 +663,7 @@ class BrightDataTester:
             )
             print(row)
 
-        print("-" * 180)
+        print("-" * 200)
 
 
 def parse_args() -> argparse.Namespace:
@@ -625,6 +683,12 @@ def parse_args() -> argparse.Namespace:
 
   # 使用 JSON 响应格式并保存详细记录
   python brigtdata_serp.py -t YOUR_TOKEN -z serp_api1 -e search --format json --save-details
+  
+  # 经济模式：限制 QPS 为 5，只发送 100 个请求
+  python brigtdata_serp.py -t YOUR_TOKEN -z serp_api1 -e search --target-qps 5 --max-requests 100 -c 3
+  
+  # 测试不同 QPS 值以找到最优值
+  python brigtdata_serp.py -t YOUR_TOKEN -z serp_api1 -e search --target-qps 10 -d 30 -c 5
         """,
     )
 
@@ -652,6 +716,16 @@ def parse_args() -> argparse.Namespace:
         choices=[0, 1],
         default=1,
         help="是否在 URL 中附加 brd_json 参数 (默认 1；设置为 0 时不追加)",
+    )
+    parser.add_argument(
+        "--target-qps",
+        type=float,
+        help="目标请求速率 (QPS)。设置此参数可以更经济地测试，避免过度消耗 API 额度",
+    )
+    parser.add_argument(
+        "--max-requests",
+        type=int,
+        help="最大请求总数。与 --target-qps 配合使用可以精确控制测试成本",
     )
 
     return parser.parse_args()
@@ -685,10 +759,22 @@ def main() -> None:
         brd_json=args.brd_json if args.brd_json != 0 else None,
     )
 
+    # Print economical mode info if enabled
+    if args.target_qps or args.max_requests:
+        print("\n=== 经济模式已启用 ===")
+        if args.target_qps:
+            print(f"目标 QPS: {args.target_qps}")
+        if args.max_requests:
+            print(f"最大请求数: {args.max_requests}")
+        print("这将降低测试成本并允许更精确的性能测试\n")
+
     all_statistics: List[Dict[str, Any]] = []
     for concurrency in concurrency_values:
         print(f"\n>>> 并发数 {concurrency} 测试开始")
-        _, statistics = tester.run_all_engines_test(engines, args.duration, concurrency, args.query)
+        _, statistics = tester.run_all_engines_test(
+            engines, args.duration, concurrency, args.query, 
+            args.target_qps, args.max_requests
+        )
         all_statistics.extend(statistics)
     tester.save_summary_statistics(all_statistics, args.output)
 
