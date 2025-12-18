@@ -415,7 +415,7 @@ class BrightDataTester:
         
         return round_robin_query
 
-    def _run_worker_until(self, engine: str, next_query_fn, end_time: float) -> List[Dict[str, Any]]:
+    def _run_worker_until(self, engine: str, next_query_fn, end_time: float, concurrency: int) -> List[Dict[str, Any]]:
         """
         Worker function that runs requests until end_time is reached.
         Returns list of result dictionaries.
@@ -424,6 +424,7 @@ class BrightDataTester:
         while time.perf_counter() < end_time:
             query = next_query_fn()
             result = self.make_request(engine, query)
+            result["concurrency"] = concurrency
             results.append(result)
         return results
 
@@ -451,7 +452,7 @@ class BrightDataTester:
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
             # Submit workers
             futures = [
-                executor.submit(self._run_worker_until, engine, next_query_fn, end_time)
+                executor.submit(self._run_worker_until, engine, next_query_fn, end_time, concurrency)
                 for _ in range(concurrency)
             ]
             
@@ -462,8 +463,6 @@ class BrightDataTester:
         
         actual_duration = round(time.perf_counter() - start, 3)
         total_requests = len(results)
-        for result in results:
-            result["concurrency"] = concurrency
         
         stats = self._calculate_statistics(engine, total_requests, concurrency, actual_duration, results)
         
