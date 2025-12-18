@@ -544,9 +544,6 @@ class BrightDataTester:
             "product",
         ]
 
-        for result in results:
-            result.setdefault("concurrency", concurrency)
-
         with open(filename, "w", newline="", encoding="utf-8") as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
@@ -622,7 +619,7 @@ def parse_args() -> argparse.Namespace:
   python brigtdata_serp.py -t YOUR_TOKEN -z serp_api1 -e search -d 60 -c 5
  
   # 指定查询关键词并测试多个引擎
-  python brigtdata_serp.py -t 178308b398771671aca4685bff17b69b86ce1549fedc0690683374d030b86e86 -z serp_api1 -e search -d 30 -c 3 --format json --brd-json 1 --save-details
+  python brigtdata_serp.py -t YOUR_TOKEN -z serp_api1 -e search -d 30 -c 3 --format json --brd-json 1 --save-details
 
   # 为同一批引擎依次运行多个并发配置
   python brigtdata_serp.py -t YOUR_TOKEN -z serp_api1 -e search maps -d 30 -c 1 5 10
@@ -679,7 +676,7 @@ def main() -> None:
         return
 
     engines = list(BrightDataTester.SUPPORTED_ENGINES.keys()) if args.all_engines else args.engines
-    concurrency_values = args.concurrency if isinstance(args.concurrency, list) else [args.concurrency]
+    concurrency_values = args.concurrency
 
     tester = BrightDataTester(
         api_token=args.api_token,
