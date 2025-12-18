@@ -417,7 +417,7 @@ class BrightDataTester:
 
     def _run_worker_until(self, engine: str, next_query_fn, end_time: float, concurrency: int, 
                          target_qps: Optional[float] = None, max_requests: Optional[int] = None,
-                         request_counter: Optional[list] = None) -> List[Dict[str, Any]]:
+                         request_counter: Optional[list] = None, counter_lock: Optional[threading.Lock] = None) -> List[Dict[str, Any]]:
         """
         Worker function that runs requests until end_time is reached or max_requests is hit.
         
@@ -429,6 +429,7 @@ class BrightDataTester:
             target_qps: If set, pace requests to achieve this QPS (per worker)
             max_requests: If set, stop after total requests across all workers reaches this
             request_counter: Shared list for tracking total requests (for max_requests)
+            counter_lock: Lock for thread-safe access to request_counter
             
         Returns list of result dictionaries.
         """
@@ -439,10 +440,11 @@ class BrightDataTester:
         last_request_time = time.perf_counter()
         
         while time.perf_counter() < end_time:
-            # Check max_requests limit
-            if max_requests and request_counter is not None:
-                if len(request_counter) >= max_requests:
-                    break
+            # Check max_requests limit (thread-safe)
+            if max_requests and request_counter is not None and counter_lock is not None:
+                with counter_lock:
+                    if len(request_counter) >= max_requests:
+                        break
             
             # Rate limiting: wait if we're going too fast
             if worker_qps:
@@ -455,19 +457,19 @@ class BrightDataTester:
             # Check again after sleep
             if time.perf_counter() >= end_time:
                 break
-                
-            if max_requests and request_counter is not None:
-                if len(request_counter) >= max_requests:
-                    break
+            
+            # Double-check max_requests after potential sleep (thread-safe)
+            if max_requests and request_counter is not None and counter_lock is not None:
+                with counter_lock:
+                    if len(request_counter) >= max_requests:
+                        break
+                    # Reserve this slot
+                    request_counter.append(1)
             
             query = next_query_fn()
             result = self.make_request(engine, query)
             result["concurrency"] = concurrency
             results.append(result)
-            
-            # Update shared counter
-            if request_counter is not None:
-                request_counter.append(1)
         
         return results
 
@@ -492,8 +494,9 @@ class BrightDataTester:
         end_time = time.perf_counter() + duration_seconds
         next_query_fn = self._get_next_query_fn(engine, explicit_query)
         
-        # Shared counter for max_requests limit (thread-safe via GIL for list append)
+        # Shared counter and lock for max_requests limit (thread-safe)
         request_counter = [] if max_requests else None
+        counter_lock = threading.Lock() if max_requests else None
         
         results: List[Dict[str, Any]] = []
         start = time.perf_counter()
@@ -502,7 +505,7 @@ class BrightDataTester:
             # Submit workers
             futures = [
                 executor.submit(self._run_worker_until, engine, next_query_fn, end_time, concurrency,
-                              target_qps, max_requests, request_counter)
+                              target_qps, max_requests, request_counter, counter_lock)
                 for _ in range(concurrency)
             ]
             
