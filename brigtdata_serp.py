@@ -462,11 +462,13 @@ class BrightDataTester:
         
         actual_duration = round(time.perf_counter() - start, 3)
         total_requests = len(results)
+        for result in results:
+            result["concurrency"] = concurrency
         
         stats = self._calculate_statistics(engine, total_requests, concurrency, actual_duration, results)
         
         if self.save_details:
-            self._save_detailed_csv(engine, results)
+            self._save_detailed_csv(engine, concurrency, results)
         
         return results, stats
 
@@ -526,11 +528,12 @@ class BrightDataTester:
         self._print_statistics_table([stats])
         return stats
 
-    def _save_detailed_csv(self, engine: str, results: List[Dict[str, Any]]) -> None:
-        filename = f"brightdata_{engine}_details_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    def _save_detailed_csv(self, engine: str, concurrency: int, results: List[Dict[str, Any]]) -> None:
+        filename = f"brightdata_{engine}_c{concurrency}_details_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         fieldnames = [
             "timestamp",
             "engine",
+            "concurrency",
             "query",
             "status_code",
             "response_time",
@@ -540,6 +543,9 @@ class BrightDataTester:
             "response_excerpt",
             "product",
         ]
+
+        for result in results:
+            result.setdefault("concurrency", concurrency)
 
         with open(filename, "w", newline="", encoding="utf-8") as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -614,9 +620,12 @@ def parse_args() -> argparse.Namespace:
 示例用法:
   # 测试单个引擎 60 秒 (默认随机关键词)
   python brigtdata_serp.py -t YOUR_TOKEN -z serp_api1 -e search -d 60 -c 5
-
+ 
   # 指定查询关键词并测试多个引擎
   python brigtdata_serp.py -t 178308b398771671aca4685bff17b69b86ce1549fedc0690683374d030b86e86 -z serp_api1 -e search -d 30 -c 3 --format json --brd-json 1 --save-details
+
+  # 为同一批引擎依次运行多个并发配置
+  python brigtdata_serp.py -t YOUR_TOKEN -z serp_api1 -e search maps -d 30 -c 1 5 10
 
   # 使用 JSON 响应格式并保存详细记录
   python brigtdata_serp.py -t YOUR_TOKEN -z serp_api1 -e search --format json --save-details
@@ -628,7 +637,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("-e", "--engines", nargs="+", help="要测试的引擎列表")
     parser.add_argument("--all-engines", action="store_true", help="测试所有支持的引擎")
     parser.add_argument("-d", "--duration", type=int, default=60, help="每个引擎测试时长（秒）")
-    parser.add_argument("-c", "--concurrency", type=int, default=3, help="并发数")
+    parser.add_argument(
+        "-c",
+        "--concurrency",
+        type=int,
+        nargs="+",
+        default=[3],
+        help="并发数，可指定多个值依次运行",
+    )
     parser.add_argument("-q", "--query", help="指定查询关键词 (默认随机)")
     parser.add_argument("--format", choices=["raw", "json"], default="raw", help="Bright Data 响应格式")
     parser.add_argument("--save-details", action="store_true", help="保存每个请求的详细 CSV 记录")
@@ -663,6 +679,7 @@ def main() -> None:
         return
 
     engines = list(BrightDataTester.SUPPORTED_ENGINES.keys()) if args.all_engines else args.engines
+    concurrency_values = args.concurrency if isinstance(args.concurrency, list) else [args.concurrency]
 
     tester = BrightDataTester(
         api_token=args.api_token,
@@ -672,8 +689,12 @@ def main() -> None:
         brd_json=args.brd_json if args.brd_json != 0 else None,
     )
 
-    _, statistics = tester.run_all_engines_test(engines, args.duration, args.concurrency, args.query)
-    tester.save_summary_statistics(statistics, args.output)
+    all_statistics: List[Dict[str, Any]] = []
+    for concurrency in concurrency_values:
+        print(f"\n>>> 并发数 {concurrency} 测试开始")
+        _, statistics = tester.run_all_engines_test(engines, args.duration, concurrency, args.query)
+        all_statistics.extend(statistics)
+    tester.save_summary_statistics(all_statistics, args.output)
 
 
 if __name__ == "__main__":
