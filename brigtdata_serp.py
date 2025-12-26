@@ -324,7 +324,7 @@ class BrightDataTester:
         if response.status_code != 200:
             return False, f"HTTP {response.status_code}"
 
-        if not response.content:
+        if not response.content and parsed_json is None:
             return False, "Empty response"
 
         if parsed_json is not None:
