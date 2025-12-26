@@ -303,8 +303,8 @@ class BrightDataTester:
 
             result["status_code"] = response.status_code
             result["response_time"] = duration
-            result["response_size"] = round(len(response.content) / 1024, 3)
             parsed_json = self._try_parse_json(response)
+            result["response_size"] = self._calculate_response_size(response, parsed_json)
             result["response_excerpt"] = self._extract_excerpt(parsed_json, response)
 
             success, error_message = self._evaluate_response(response, parsed_json)
@@ -324,7 +324,7 @@ class BrightDataTester:
         if response.status_code != 200:
             return False, f"HTTP {response.status_code}"
 
-        if not response.content:
+        if not response.content and parsed_json is None:
             return False, "Empty response"
 
         if parsed_json is not None:
@@ -337,21 +337,32 @@ class BrightDataTester:
                 if proxy_status and proxy_status != 200:
                     return False, f"Proxy status {proxy_status}"
 
+                if self.response_format == "json" or self.brd_json:
+                    if "organic" in parsed_json and not isinstance(parsed_json.get("organic"), list):
+                        return False, "Invalid organic payload"
+                    if not self._looks_like_serp_payload(parsed_json) and "body" not in parsed_json:
+                        return False, "Unexpected payload structure"
+
         return True, ""
 
     def _try_parse_json(self, response: requests.Response) -> Optional[Dict[str, Any]]:
         # When the caller requested JSON, attempt to parse even if the content type is missing
         # or incorrect, to better surface Bright Data payload errors/excerpts.
         if self.response_format != "json":
-            content_type = response.headers.get("Content-Type", "").lower()
-            if "json" not in content_type and not response.text.strip().startswith("{"):
-                return None
+            if not self.brd_json:
+                content_type = response.headers.get("Content-Type", "").lower()
+                if "json" not in content_type and not response.text.strip().startswith("{"):
+                    return None
 
         try:
             parsed = response.json()
             return parsed if isinstance(parsed, dict) else None
         except Exception:
-            return None
+            try:
+                parsed = json.loads(response.text)
+                return parsed if isinstance(parsed, dict) else None
+            except Exception:
+                return None
 
     @staticmethod
     def _extract_error_from_payload(payload: Dict[str, Any]) -> str:
@@ -368,8 +379,61 @@ class BrightDataTester:
             return f"{payload.get('error')}{error_code}{detail_suffix}"
         return ""
 
+    @staticmethod
+    def _looks_like_serp_payload(payload: Dict[str, Any]) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        organic = payload.get("organic")
+        if isinstance(organic, list):
+            return True
+        expected_keys = {"general", "input", "navigation"}
+        return any(key in payload for key in expected_keys)
+
+    @staticmethod
+    def _summarize_organic_results(results: Any, limit: int = 3) -> List[Dict[str, Any]]:
+        if not isinstance(results, list):
+            return []
+        summary: List[Dict[str, Any]] = []
+        for item in results[:limit]:
+            if not isinstance(item, dict):
+                continue
+            summary.append(
+                {
+                    "title": item.get("title"),
+                    "link": item.get("link"),
+                    "source": item.get("source"),
+                    "description": item.get("description"),
+                    "rank": item.get("rank"),
+                }
+            )
+        return summary
+
+    @staticmethod
+    def _calculate_response_size(
+            response: requests.Response, parsed_json: Optional[Dict[str, Any]]
+    ) -> float:
+        if response.content:
+            return round(len(response.content) / 1024, 3)
+        if parsed_json is not None:
+            payload = json.dumps(parsed_json, ensure_ascii=False).encode("utf-8")
+            return round(len(payload) / 1024, 3)
+        if response.text:
+            return round(len(response.text.encode("utf-8")) / 1024, 3)
+        return 0.0
+
     def _extract_excerpt(self, parsed_json: Optional[Dict[str, Any]], response: requests.Response) -> str:
         if parsed_json:
+            if self._looks_like_serp_payload(parsed_json):
+                excerpt_payload = {
+                    "general": parsed_json.get("general"),
+                    "input": parsed_json.get("input"),
+                    "organic": self._summarize_organic_results(parsed_json.get("organic")),
+                }
+                if "navigation" in parsed_json:
+                    navigation = parsed_json.get("navigation")
+                    excerpt_payload["navigation_count"] = len(navigation) if isinstance(navigation, list) else 0
+                return json.dumps(excerpt_payload, ensure_ascii=False)[:1000]
+
             # For JSON responses, prioritize a JSON snippet so the CSV clearly shows
             # the structured payload instead of embedded HTML.
             if self.response_format == "json":
