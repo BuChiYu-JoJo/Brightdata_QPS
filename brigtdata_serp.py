@@ -349,9 +349,10 @@ class BrightDataTester:
         # When the caller requested JSON, attempt to parse even if the content type is missing
         # or incorrect, to better surface Bright Data payload errors/excerpts.
         if self.response_format != "json":
-            content_type = response.headers.get("Content-Type", "").lower()
-            if "json" not in content_type and not response.text.strip().startswith("{"):
-                return None
+            if not self.brd_json:
+                content_type = response.headers.get("Content-Type", "").lower()
+                if "json" not in content_type and not response.text.strip().startswith("{"):
+                    return None
 
         try:
             parsed = response.json()
