@@ -303,8 +303,8 @@ class BrightDataTester:
 
             result["status_code"] = response.status_code
             result["response_time"] = duration
-            result["response_size"] = round(len(response.content) / 1024, 3)
             parsed_json = self._try_parse_json(response)
+            result["response_size"] = self._calculate_response_size(response, parsed_json)
             result["response_excerpt"] = self._extract_excerpt(parsed_json, response)
 
             success, error_message = self._evaluate_response(response, parsed_json)
@@ -358,7 +358,11 @@ class BrightDataTester:
             parsed = response.json()
             return parsed if isinstance(parsed, dict) else None
         except Exception:
-            return None
+            try:
+                parsed = json.loads(response.text)
+                return parsed if isinstance(parsed, dict) else None
+            except Exception:
+                return None
 
     @staticmethod
     def _extract_error_from_payload(payload: Dict[str, Any]) -> str:
@@ -403,6 +407,19 @@ class BrightDataTester:
                 }
             )
         return summary
+
+    @staticmethod
+    def _calculate_response_size(
+            response: requests.Response, parsed_json: Optional[Dict[str, Any]]
+    ) -> float:
+        if response.content:
+            return round(len(response.content) / 1024, 3)
+        if parsed_json is not None:
+            payload = json.dumps(parsed_json, ensure_ascii=False).encode("utf-8")
+            return round(len(payload) / 1024, 3)
+        if response.text:
+            return round(len(response.text.encode("utf-8")) / 1024, 3)
+        return 0.0
 
     def _extract_excerpt(self, parsed_json: Optional[Dict[str, Any]], response: requests.Response) -> str:
         if parsed_json:
